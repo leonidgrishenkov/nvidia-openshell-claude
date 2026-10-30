@@ -15,5 +15,6 @@ WORKDIR /sandbox
 USER claude
 
 ENV DISABLE_AUTOUPDATER=1
-# No telemetry or error reporting (statsig.anthropic.com, sentry.io)
+# No telemetry or error reporting (otherwise Claude sends logs to Datadog,
+# which the policy blocks)
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1

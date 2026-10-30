@@ -268,11 +268,9 @@ drafts a rule. Approved rules hot-reload without a restart.
 | Update the stored key from your env     | `openshell provider update claude --from-existing`            |
 | Delete a provider                       | `openshell provider delete claude`                            |
 
-To let Claude push to GitHub, import
-[`providers/github.yaml`](https://github.com/NVIDIA/OpenShell/blob/main/providers/github.yaml)
-the same way, create a provider with `--type github --credential GITHUB_TOKEN`, and
-add a second `--provider` flag on `sandbox create`. Providers can also be changed on
-a running sandbox with `openshell sandbox provider attach` / `detach`.
+Providers can also be changed on a running sandbox with
+`openshell sandbox provider attach` / `detach`. To add GitHub or another service,
+see [Secrets and environment variables](#secrets-and-environment-variables).
 
 ### Useful `sandbox create` flags
 
@@ -288,6 +286,118 @@ a running sandbox with `openshell sandbox provider attach` / `detach`.
 | `--gpu` / `--gpu 2`          | Attach one or more GPUs (needs a GPU-capable image)      |
 | `--cpu 2 --memory 4Gi`       | Resource limits                                          |
 | `--editor vscode`            | Open VS Code (or `cursor`) in the sandbox workspace      |
+
+## Secrets and environment variables
+
+| Kind                                        | How                                                          | Agent sees the real value? |
+| ------------------------------------------- | ------------------------------------------------------------ | -------------------------- |
+| Plain settings (`DEBUG=1`, a region, a URL) | `sandbox create --env KEY=VALUE`, or `ENV` in the Dockerfile | Yes                        |
+| Secrets (API keys, tokens)                  | A provider, attached with `--provider`                       | No — only a placeholder    |
+
+Never put secrets in `--env`, the image, or uploaded files. `--upload` skips
+`.gitignore`d files such as `.env` unless you pass `--no-git-ignore`.
+
+### How providers hide secrets
+
+The secret is stored in the gateway, outside the sandbox. Inside, the variable
+holds a placeholder such as `openshell:resolve:env:v1663…_MY_API_TOKEN`. When a
+program sends that placeholder in an HTTP request to one of the provider profile's
+endpoints, the OpenShell proxy replaces it with the real value on the way out.
+
+The proxy replaces placeholders in headers (including Basic auth), query
+parameters, and URL paths. Request bodies and WebSocket messages need
+`request_body_credential_rewrite` / `websocket_credential_rewrite` on the endpoint.
+Cookies are never rewritten, and a placeholder sent anywhere else is rejected.
+
+### Add a secret for another service
+
+Write a provider profile that names the variable, where the secret may be sent,
+and which programs may send it:
+
+```yaml
+# my-api.yaml
+id: my-api
+display_name: My API
+description: Token for api.example.com
+credentials:
+  - name: token
+    env_vars: [MY_API_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization # required for bearer
+discovery:
+  credentials: [token]
+endpoints: # the only places the secret is ever sent
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-only # or explicit method/path rules
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl # programs allowed to reach those endpoints
+```
+
+```sh
+openshell profile lint -f my-api.yaml
+openshell profile import --global -f my-api.yaml
+
+set -gx MY_API_TOKEN ...   # read from the shell, so the value is not on the command line
+openshell provider create --name my-api --type my-api --from-existing
+
+openshell sandbox create ... --provider claude --provider my-api -- claude
+# or, on a running sandbox (start a new agent process to get the variable):
+openshell sandbox provider attach claude-dev my-api
+```
+
+Rotate the secret with `openshell provider update my-api --from-existing`.
+
+### GitHub
+
+[`providers/github.yaml`](providers/github.yaml) is NVIDIA's example GitHub
+profile, copied unchanged from the
+[OpenShell repository](https://github.com/NVIDIA/OpenShell/blob/main/providers/github.yaml).
+It sends `GITHUB_TOKEN` / `GH_TOKEN` only to `api.github.com` (REST and GraphQL,
+read-only) and `github.com` (clone and fetch), for `git` and `gh`. **Push is
+denied.** The image has `git` at `/usr/bin/git`, which the profile lists; `gh` is
+not installed.
+
+```sh
+openshell profile import --global -f providers/github.yaml
+
+set -gx GITHUB_TOKEN github_pat_...   # a fine-grained token with minimal scope
+openshell provider create --name github --type github --from-existing
+
+openshell sandbox create --name claude-dev --from openshell-claude:latest \
+  --provider claude --provider github --policy policy.yaml -- claude
+```
+
+`git` does not read `GITHUB_TOKEN` by itself. Public repositories clone without
+it; for private ones, configure a credential helper inside the sandbox that
+answers with the placeholder, which the proxy resolves in the Basic auth header:
+
+```sh
+git config --global credential.https://github.com.helper \
+  '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+```
+
+With this provider attached, the `github_clone` example in `policy.yaml` is not
+needed. To allow pushing to a single repository, add a repository-scoped rule for
+`git-receive-pack` to the policy, as in NVIDIA's
+[GitHub push tutorial](https://docs.nvidia.com/openshell/latest/tutorials/github-push-access).
+
+### Limits
+
+- **An endpoint that echoes requests back leaks the secret.** Because placeholders
+  are resolved in query parameters and paths, an allowed endpoint that echoes the
+  request, quotes parameters in error messages, or stores data the agent can read
+  back returns the real value. With an echo service (httpbin.org) as the endpoint,
+  `?leak=$TOKEN` came back as the real token. List only the hosts that need the
+  secret, narrow them with method/path rules, and use least-privilege tokens.
+- **Only HTTP(S) requests to the profile's endpoints can carry the real value.** SSH
+  keys (git over SSH), database passwords over raw TCP, and secrets used locally
+  (to decrypt or sign files) cannot be hidden — the process needs the real value.
+  Use short-lived, narrowly scoped credentials for those, or keep that work outside
+  the agent.
 
 ## Troubleshooting
 
