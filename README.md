@@ -48,11 +48,23 @@ copies the binary to `/usr/local/bin/claude` — one of the two paths the
 non-root user, which OpenShell requires for Docker and Podman.
 
 ```sh
-docker build -t claude-agent:latest .
+docker build -t openshell-claude:latest .
 ```
 
 OpenShell replaces the image's `CMD`/`ENTRYPOINT` with its own supervisor, so the
 command to run is always passed after `--` on `sandbox create`.
+
+The image sets two environment variables:
+
+- `DISABLE_AUTOUPDATER=1` — the policy blocks the updater's download hosts anyway.
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` — no telemetry or error reporting.
+  Without it, Claude Code 2.1.314 tries to send logs to
+  `http-intake.logs.us5.datadoghq.com` on every run; the policy blocks it, but
+  each attempt shows up as a denial and a pending rule proposal.
+
+Image `ENV` reaches the sandbox's main process and everything it starts, but not
+commands run with `openshell sandbox exec`. Pass `--env KEY=VALUE` to `exec` when
+you run `claude` that way.
 
 ### 2. Import the Claude Code provider profile
 
@@ -63,8 +75,11 @@ openshell profile import --global \
 
 The profile lets `/usr/bin/claude` and `/usr/local/bin/claude` reach
 `api.anthropic.com`, plus `statsig.anthropic.com` and `sentry.io` for Claude Code's
-telemetry. To block telemetry, download the file, remove those two endpoints, and
-import your copy with `-f`.
+telemetry. Claude Code 2.1.314 did not contact either of them in testing, and
+`sentry.io` is a third-party service anyone can create an account on, so it is a
+possible way to send data out. To remove them, download the file, delete those two
+endpoints, and import your copy with `-f` (or `openshell profile update --global -f
+claude-code.yaml claude-code` if it is already imported).
 
 ### 3. Create a provider with your API key
 
@@ -86,7 +101,7 @@ requests to the profile's endpoints.
 ### Smoke test
 
 ```sh
-openshell sandbox create --name smoke --from claude-agent:latest \
+openshell sandbox create --name smoke --from openshell-claude:latest \
   --provider claude -- claude --model haiku -p 'reply with OK'
 openshell sandbox delete smoke
 ```
@@ -99,7 +114,7 @@ That is expected — delete it afterwards.
 Run interactive `claude` as the sandbox's main process:
 
 ```sh
-openshell sandbox create --name claude-dev --from claude-agent:latest \
+openshell sandbox create --name claude-dev --from openshell-claude:latest \
   --provider claude -- claude
 ```
 
@@ -109,7 +124,7 @@ openshell sandbox create --name claude-dev --from claude-agent:latest \
 inside the sandbox and start Claude from there:
 
 ```sh
-openshell sandbox create --name claude-dev --from claude-agent:latest \
+openshell sandbox create --name claude-dev --from openshell-claude:latest \
   --provider claude --upload ./my-project:/sandbox/my-project
 
 # inside the sandbox
@@ -159,6 +174,73 @@ restored), waits for `Ready`, and then you can `connect`.
 | Start a stopped or completed sandbox    | `openshell sandbox start claude-dev`                        |
 | Delete one or more sandboxes            | `openshell sandbox delete claude-dev smoke`                 |
 
+### Network rules
+
+[`policy.yaml`](policy.yaml) is the sandbox policy: which paths the agent can read
+and write, and which hosts each program can reach. Everything it does not list is
+denied; the `claude` provider adds its own rule for `api.anthropic.com`. Create the
+sandbox with it:
+
+```sh
+openshell sandbox create --name claude-dev --from openshell-claude:latest \
+  --provider claude --policy policy.yaml -- claude
+```
+
+Network rules can be changed while the sandbox runs. OpenShell closes connections
+opened under the old rules, and the next request is checked against the new ones.
+Filesystem and Landlock settings are fixed at startup; changing them needs a new
+sandbox.
+
+| Task                                            | Command                                                          |
+| ----------------------------------------------- | ---------------------------------------------------------------- |
+| Apply edited `network_policies` from the file   | `openshell policy set claude-dev --policy policy.yaml --wait`    |
+| Remove a rule                                   | `openshell policy update claude-dev --remove-rule <name> --wait` |
+| Show the base policy (what you set)             | `openshell policy get claude-dev --base`                         |
+| Show the effective policy (with provider rules) | `openshell policy get claude-dev --full`                         |
+| List policy revisions and whether they loaded   | `openshell policy list claude-dev`                               |
+| See why a request was denied                    | `openshell logs claude-dev --since 10m --source sandbox`         |
+
+To add one host without editing the file, use `policy update`. For example, to let
+Claude's WebFetch read PyPI pages:
+
+```sh
+openshell policy update claude-dev --rule-name pypi_docs \
+  --binary /usr/local/bin/claude \
+  --add-endpoint pypi.org:443:read-only:rest:enforce --wait
+```
+
+The endpoint format is `host:port:access:protocol:enforcement`. Replace `--wait`
+with `--dry-run` to preview a change. `--binary` must be the real path, not a
+symlink, and a rule also covers every process that binary starts — see the
+comments in `policy.yaml`.
+
+`policy set` replaces the whole policy, so use it only on a sandbox created from
+`policy.yaml`. OpenShell rejects changes to removed filesystem paths, Landlock, or
+process settings on a running sandbox, and saves added paths without applying them.
+
+#### WebSearch is not covered by the network policy
+
+Claude's WebSearch tool runs on Anthropic's servers, and its results come back
+through `api.anthropic.com`, so the sandbox policy cannot block it — it works even
+when the policy allows no web hosts at all. Search results are untrusted content,
+and therefore a possible source of prompt injection. To turn WebSearch off, deny it
+in Claude Code's managed settings inside the image. Create `managed-settings.json`:
+
+```json
+{ "permissions": { "deny": ["WebSearch"] } }
+```
+
+and copy it into the image in the `Dockerfile`:
+
+```dockerfile
+USER root
+COPY managed-settings.json /etc/claude-code/managed-settings.json
+USER claude
+```
+
+Managed settings take precedence over user and project settings, and `/etc` is
+read-only in the sandbox, so the agent cannot turn WebSearch back on.
+
 ### Network approvals
 
 The default policy is restrictive. When Claude reaches a host the policy does not
@@ -182,9 +264,9 @@ drafts a rule. Approved rules hot-reload without a restart.
 | List imported profiles                  | `openshell profile list`                                      |
 | Show what a profile allows              | `openshell profile describe claude-code`                      |
 | List providers                          | `openshell provider list`                                     |
-| Show a provider                         | `openshell provider get claude`                            |
-| Update the stored key from your env     | `openshell provider update claude --from-existing`         |
-| Delete a provider                       | `openshell provider delete claude`                         |
+| Show a provider                         | `openshell provider get claude`                               |
+| Update the stored key from your env     | `openshell provider update claude --from-existing`            |
+| Delete a provider                       | `openshell provider delete claude`                            |
 
 To let Claude push to GitHub, import
 [`providers/github.yaml`](https://github.com/NVIDIA/OpenShell/blob/main/providers/github.yaml)
@@ -197,8 +279,9 @@ a running sandbox with `openshell sandbox provider attach` / `detach`.
 | Flag                         | Purpose                                                  |
 | ---------------------------- | -------------------------------------------------------- |
 | `--name <name>`              | Name the sandbox (otherwise a random name is generated)  |
-| `--from <image>`             | Image to run (`claude-agent:latest`)                     |
+| `--from <image>`             | Image to run (`openshell-claude:latest`)                 |
 | `--provider <name>`          | Attach a provider; repeat for several                    |
+| `--policy <file>`            | Sandbox policy (`policy.yaml`)                           |
 | `--upload <local>:<remote>`  | Upload files at creation; repeat for several             |
 | `--detach`                   | Create without attaching                                 |
 | `--forward <port>`           | Forward a port, e.g. a dev server inside the sandbox     |

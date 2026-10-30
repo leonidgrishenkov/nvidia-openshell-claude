@@ -15,3 +15,5 @@ WORKDIR /sandbox
 USER claude
 
 ENV DISABLE_AUTOUPDATER=1
+# No telemetry or error reporting (statsig.anthropic.com, sentry.io)
+ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1

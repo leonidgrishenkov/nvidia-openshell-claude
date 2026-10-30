@@ -1,0 +1,81 @@
+# OpenShell sandbox policy for Claude Code.
+#
+#   openshell sandbox create --policy policy.yaml ...
+#
+# Everything not listed here is denied. The `claude` provider adds its own rule
+# for api.anthropic.com (see the claude-code provider profile), so it is not
+# repeated here.
+#
+# filesystem_policy and landlock are fixed when the sandbox starts; changing
+# them needs a new sandbox. network_policies can be changed on a running
+# sandbox with `openshell policy set` or `openshell policy update`.
+version: 1
+
+# Files the agent can read and write (enforced by Landlock).
+filesystem_policy:
+  include_workdir: true # /sandbox, where the project is uploaded: read-write
+  read_only:
+    - /usr
+    - /lib
+    - /etc
+    - /proc
+    - /dev/urandom
+    - /var/log
+  read_write:
+    - /tmp
+    - /dev/null
+    - /home/claude # Claude Code state: ~/.claude and ~/.claude.json
+
+# Refuse to start rather than run without the filesystem rules above.
+landlock:
+  compatibility: hard_requirement
+
+# Hosts each program can reach, and which HTTP requests it can send.
+#
+# - `binaries` must be real paths, not symlinks (`readlink -f` in the sandbox).
+# - A rule also covers every process the listed binary starts. Listing
+#   /usr/local/bin/claude therefore opens the endpoint to every command Claude
+#   runs, not only to Claude itself.
+# - `access: read-only` allows GET/HEAD/OPTIONS; `enforcement: enforce` blocks
+#   everything else (`audit` only logs it).
+#
+# Uncomment and adapt the examples you need, then delete the `{}` line.
+# When a request is denied, `openshell logs <sandbox> --source sandbox` shows
+# the binary path and host OpenShell saw.
+network_policies:
+  {}
+
+  # Let Claude's WebFetch tool read documentation sites.
+  # docs:
+  #   endpoints:
+  #     - host: docs.python.org
+  #       port: 443
+  #       protocol: rest
+  #       enforcement: enforce
+  #       access: read-only
+  #     - host: developer.mozilla.org
+  #       port: 443
+  #       protocol: rest
+  #       enforcement: enforce
+  #       access: read-only
+  #   binaries:
+  #     - path: /usr/local/bin/claude
+
+  # Let git clone and fetch from GitHub over HTTPS, but not push.
+  # github_clone:
+  #   endpoints:
+  #     - host: github.com
+  #       port: 443
+  #       protocol: rest
+  #       enforcement: enforce
+  #       rules:
+  #         - allow:
+  #             method: GET
+  #             path: "/**/info/refs"
+  #             query:
+  #               service: git-upload-pack
+  #         - allow:
+  #             method: POST
+  #             path: "/**/git-upload-pack"
+  #   binaries:
+  #     - path: /usr/lib/git-core/git-remote-http
